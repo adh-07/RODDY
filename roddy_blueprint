@@ -1,0 +1,344 @@
+# JARVIS - BLUEPRINT
+
+Put this file at `docs/BLUEPRINT.md`. Antigravity reads it before every task.
+As-of date for all model and pricing facts: 2026-11-05. Re-verify before relying on them.
+
+## 1. How we win
+
+One user, one machine. Success means the four must-haves work live, measurably:
+1. FULL-DUPLEX VOICE with barge-in: interrupt mid-sentence, speech stops <= 200 ms, Jarvis keeps what it had said, answers the interruption.
+2. TASKS BY VOICE, starting with WhatsApp, behind a mandatory spoken confirmation gate.
+3. BROWSER AWARENESS: sees the current tab and explains it in context, with a strict never-shared list.
+4. TUTOR MODE: L0-L4 explanations, learner memory, quizzes, spaced repetition.
+
+Edge, in order: (1) measured latency, logged every turn; (2) a safety layer (tiers, gate, audit, kill phrase) so a misheard word never sends a wrong message; (3) a startup health check that fails loudly when Google retires a model; (4) a cost guard so a forgotten open session cannot surprise you; (5) a voice layer behind an interface so the model or provider can be swapped.
+
+## 2. Product shape
+
+A background desktop daemon (Windows-first, tray icon) plus a Chrome Manifest V3 extension. The extension is the browser sensor and its side panel is the UI. A website alone is rejected: a page cannot run in the background, read other tabs, or drive WhatsApp.
+
+## 3. Tech stack
+
+| Layer | Choice |
+|---|---|
+| Language | Python 3.12 (pinned lockfile), plain-JS MV3 extension (no build step) |
+| Voice, cloud | `google-genai` Live API session, model from `GEMINI_LIVE_MODEL`, own audio loop (DR-1) |
+| Voice, local | Silero VAD, faster-whisper, Piper (Kokoro optional) as `LocalPipelineVoice` |
+| Audio I/O | `sounddevice` (PortAudio); AEC via `livekit.rtc.AudioProcessingModule` (UNVERIFIED, proven in P2) |
+| Text brain | Gemini text model from `GEMINI_TEXT_MODEL`; offline Ollama from `OLLAMA_MODEL` |
+| WhatsApp | Playwright (persistent profile) on WhatsApp Web, `rapidfuzz` for contact matching |
+| Memory | SQLite (turns, learner, audit, cost) + ChromaDB (semantic notes) |
+| Bridge | `websockets` on 127.0.0.1 with a random token, Origin-checked |
+| Tray/UI | `pystray` tray + extension side panel; PyQt popup deleted in P7 |
+| Tests | pytest, FakeAudioIO, recorded WAV fixtures, a local HTML fixture for WhatsApp |
+| Packaging | PyInstaller one-folder + Windows startup shortcut (P7) |
+
+LiveKit server, `bin/livekit-server.exe`, `docs/jarvis_voice.html`, Redis, selenium, pywhatkit and playsound are removed.
+
+## 4. Architecture
+
+Colors: green kept, yellow rewritten, blue new, red deleted.
+
+```mermaid
+flowchart LR
+  classDef kept fill:#d9f2e0,stroke:#2e7d4f,color:#111
+  classDef rewritten fill:#fff1c9,stroke:#b8860b,color:#111
+  classDef new fill:#dbe8ff,stroke:#2f5fb3,color:#111
+  classDef deleted fill:#f9d6d5,stroke:#b3261e,color:#111
+
+  subgraph CLIENTS["Clients"]
+    TRAY["Tray + status window"]:::new
+    EXT["Chrome MV3 extension: side panel + tab sensor"]:::new
+  end
+
+  subgraph VOICE["core/voice  (VoiceProvider interface)"]
+    AIO["AudioIO sounddevice"]:::new
+    AEC["AEC toggle"]:::new
+    VAD["Silero VAD"]:::new
+    SM["Turn state machine + latency metrics"]:::new
+    GL["GeminiLiveVoice (P1)"]:::new
+    LP["LocalPipelineVoice: faster-whisper + Piper (offline, swap path)"]:::new
+  end
+
+  subgraph BRAIN["core/brain  (only place LLM SDKs are imported)"]
+    THINK["Brain.think(): text planning, tutoring, quizzes"]:::rewritten
+    ROUTE["Model router: Gemini or Ollama"]:::rewritten
+    PRIV["PrivacyGate: denylist, redact, opt-in"]:::new
+    COST["CostGuard: minutes in and out, 80 percent warn, 100 percent stop"]:::new
+    HEALTH["Startup health check"]:::new
+    CTX["context_builder"]:::kept
+  end
+
+  subgraph SAFE["core/safety"]
+    PERM["Permission tiers T0 to T3"]:::new
+    CONF["Spoken confirmation gate"]:::new
+    AUDIT["Audit log + kill phrase"]:::new
+  end
+
+  subgraph TOOLS["tools/  (new, lowercase, function calling)"]
+    WA["whatsapp: Playwright"]:::new
+    SYS["system: apps, volume, files"]:::new
+    BR["browser tools"]:::new
+    TUT["tutor tools"]:::new
+    GW["google workspace via Apps Script + secret"]:::kept
+  end
+
+  subgraph MEM["Memory"]
+    SQL["SQLite: turns, learner model, audit, cost"]:::new
+    CHR["ChromaDB: semantic notes + page summaries"]:::kept
+  end
+
+  BWS["bridge: localhost WebSocket + random token"]:::new
+  OLL["Ollama offline model"]:::kept
+  PERC["perception/screen"]:::kept
+  BG["background monitor + decision engine"]:::kept
+  SHIMS["63 shims, 8 legacy files, empty Tools/, Redis, selenium, LiveKit server, PyQt popup"]:::deleted
+
+  TRAY --> SM
+  EXT <--> BWS
+  BWS --> BR
+  AIO --> AEC --> VAD --> SM
+  SM <--> GL
+  SM <--> LP
+  GL --> THINK
+  LP --> THINK
+  THINK --> ROUTE
+  ROUTE --> OLL
+  HEALTH --> ROUTE
+  COST --> ROUTE
+  PRIV --> THINK
+  THINK --> PERM
+  PERM --> CONF --> TOOLS
+  PERM --> AUDIT
+  TOOLS --> MEM
+  THINK --> CTX --> MEM
+  BG --> THINK
+  PERC --> CTX
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> IDLE
+  IDLE --> LISTENING: wake word or hotkey or session start
+  LISTENING --> THINKING: end of speech (VAD hangover)
+  THINKING --> SPEAKING: first audio chunk
+  THINKING --> LISTENING: cancelled by new speech
+  SPEAKING --> INTERRUPTED: local VAD hears user (cancel TTS + generation, flush buffers)
+  SPEAKING --> LISTENING: turn complete
+  INTERRUPTED --> LISTENING: buffers flushed, truncated turn saved
+  LISTENING --> IDLE: idle timeout or kill phrase
+  SPEAKING --> IDLE: kill phrase
+```
+
+## 5. Target repo layout
+
+```
+jarvis_experiment/
+  AGENTS.md  docs/BLUEPRINT.md  PHASE_PROMPTS.md  README.md
+  main.py                      launcher, <= 40 lines
+  start_jarvis.bat             3 lines: .venv\Scripts\python -m jarvis
+  requirements.in  requirements.lock  .env.example  .gitignore
+  config/denylist.yaml         banking, email, password-manager domains
+  core/
+    config.py                  ONLY reader of env vars
+    voice/   base.py state.py audio_io.py vad.py aec.py metrics.py gemini_live.py local_pipeline.py killphrase.py
+    brain/   brain.py router.py privacy.py cost.py health.py context_builder.py prompts.py
+    safety/  tiers.py gate.py audit.py
+    connectivity/
+  tools/     registry.py  system/ whatsapp/ browser/ tutor/ google/
+  bridge/    ws_server.py protocol.py
+  extension/ manifest.json service_worker.js content.js sidepanel.html sidepanel.js options.html
+  tutor/     levels.py srs.py learner.py quiz.py
+  memory/    sqlite_store.py long_term.py short_term.py
+  perception/screen/  background/
+  tests/     voice/ brain/ safety/ tools/ bridge/ tutor/ fixtures/
+  scripts/   doctor.py  measure_latency.py
+  logs/      .gitkeep
+```
+
+## 6. Voice loop spec
+
+Audio: 16 kHz mono PCM16 in, 24 kHz out (confirm in the Live docs during P1), frames of 20-32 ms.
+
+Barge-in sequence (budget 200 ms total, headphones):
+1. mic frame -> VAD says speech (target <= 40 ms from onset, needs 2 consecutive speech frames).
+2. state SPEAKING -> INTERRUPTED; stop the output stream and clear the playback queue (<= 1 frame).
+3. send the cancel signal to the provider (do not wait for the server's `interrupted` event).
+4. compute `spoken_fraction = played_samples / generated_samples`; truncate the assistant transcript to that fraction at a word boundary; save as `{role: assistant, interrupted: true, text: truncated}`.
+5. keep streaming the user's audio so their interruption is heard; go to LISTENING.
+6. context: if the provider does not retain what was said, inject a short note "[you were cut off after: ...]". Which case applies is UNVERIFIED; P2 tests it.
+
+Metrics per turn (logs/latency.jsonl): `turn_id, state_times{...}, time_to_first_audio_ms, barge_in_to_silence_ms (software, plus measured device latency), end_of_speech_to_response_ms, interrupted, spoken_fraction`.
+
+Echo: headphones first. `AEC_ENABLED=true` adds the AEC stage. Without AEC in speaker mode: raise the VAD threshold and require about 250 ms of continuous speech before cutting (slower barge-in, fewer self-interrupts).
+
+Idle timeout: close the cloud session after `SESSION_IDLE_TIMEOUT_S` of no speech (default 120) to stop input billing.
+
+## 7. Models and health check
+
+Config keys (values live only in `.env`; defaults below are what `.env.example` ships on 2026-11-05):
+
+| Key | Purpose | Example value |
+|---|---|---|
+| GEMINI_API_KEY | key from a billing-enabled Google Cloud project | (secret) |
+| GEMINI_LIVE_MODEL | voice | gemini-3.8-live |
+| GEMINI_TEXT_MODEL | planning, tutoring, quizzes, perception | gemini-3.8-flash |
+| OLLAMA_MODEL | offline brain | qwen3:4b or llama3.1:8b |
+| OLLAMA_EMBED_MODEL | embeddings | nomic-embed-text |
+| STT_LOCAL_MODEL, TTS_LOCAL_VOICE | local pipeline | faster-whisper size, Piper voice name |
+
+Startup health check (`core/brain/health.py`, also `python -m jarvis doctor`):
+1. list models from the Gemini API with the key;
+2. confirm both configured Gemini models are in the list;
+3. open a 2-second test Live session with `GEMINI_LIVE_MODEL`, send 1 s of silence, expect a clean open and close;
+4. confirm the Ollama model is pulled;
+5. on any failure: print and speak a message naming the exact retired or missing model and the fix ("GEMINI_LIVE_MODEL=gemini-3.1-flash-live-preview is retired. Set GEMINI_LIVE_MODEL in .env, then restart."), exit non-zero for cloud mode, and offer offline mode. Never fail silently.
+
+Verified against Google on 2026-11-05 (sources below):
+- gemini-2.0-flash and -001: shut down 1 Jun 2026. gemini-2.0-flash-live-001: shut down 9 Dec 2025 (this is what the old planner.py used).
+- gemini-3.1-flash-live-preview and gemini-2.5-flash-native-audio-preview-12-2025: shut down 17 Nov 2026; replacement gemini-3.8-live.
+- gemini-2.5-flash/-pro/-flash-lite: Google lists "no shutdown date announced". Your tracker's 16 Oct 2026 date is NOT confirmed on Google's page. Do not depend on 2.5.
+- Live pricing (paid): audio in $3.00 per 1M tokens = $0.005/min; audio out $12.00 per 1M = $0.018/min. Free tier: content may be used to improve Google products; paid tier: not.
+- Text: gemini-3.8-flash $0.75 in / $3.75 out per 1M tokens through 31 Dec 2026, then $1.50 / $7.50. gemini-3.5-flash-lite $0.30 / $2.50.
+- LiveKit docs: plugin default model is still the 2.5 native-audio preview (dies 17 Nov), so any LiveKit use must pass the model explicitly.
+Sources: ai.google.dev/gemini-api/docs/deprecations, ai.google.dev/gemini-api/docs/pricing, docs.livekit.io/agents/models/realtime/plugins/gemini/, pypi.org/project/livekit-plugins-google.
+NOT verified: Google's models page (fetch blocked), Live API session limits, interruption semantics, whether gemini-3.8-flash accepts images, "input billed the whole time the session listens".
+
+## 8. Cost guard
+
+Meter audio seconds actually sent and received (not wall-clock), per session, persisted in SQLite (`cost_events`).
+Rates from config: `GEMINI_LIVE_IN_USD_PER_MIN=0.005`, `GEMINI_LIVE_OUT_USD_PER_MIN=0.018`, text rates per 1M tokens with an effective date.
+Budget: `GEMINI_MONTHLY_BUDGET_USD` (required), optional `GEMINI_DAILY_BUDGET_USD`. At 80%: speak a warning once and log. At 100%: close the session, switch to offline mode, say so; stays offline until the next period or a manual override.
+Worked estimate (owner's arithmetic from the rates above, 12 spoken min per hour): continuous mic 60 x 0.005 + 12 x 0.018 = about $0.52/h; gated mic (stream about 20% of the time) about $0.28/h; an open session left 24 h costs about $7.20/day input alone, hence the idle timeout.
+The estimate can drift from Google's bill. The owner also sets a Cloud Billing budget alert.
+
+## 9. Privacy
+
+| Data | Cloud model | Rule |
+|---|---|---|
+| Your spoken audio | goes to Google while cloud Live is active | WhatsApp recipient and body use local private capture instead |
+| WhatsApp bodies, contact lists | never | local only, unless per-session opt-in `--allow-cloud-messages` |
+| Page text on a denylisted domain | never | host only, or redacted, or routed to Ollama |
+| Page text elsewhere | allowed after the "explain this page" intent | capped at 20,000 chars, wrapped as untrusted |
+| Incognito tabs, password fields, form values | never | extension drops them |
+| Logs | never contain bodies, secrets, page text | hash plus length only |
+
+`config/denylist.yaml` ships with banking, email (Gmail, Outlook, Proton), password managers (1Password, Bitwarden, LastPass), health and tax portals; the owner extends it.
+
+## 10. Permission tiers and tool set
+
+| Tool | Tier | Notes |
+|---|---|---|
+| get_time, read_screen_text, browser_get_context | T0 | audited |
+| open_app, close_app, set_volume, set_clipboard, take_note, browser_open_url, browser_switch_tab, browser_scroll | T1 | audited |
+| whatsapp_send, gmail_send, delete_file, browser_click, browser_type | T2 | confirmation gate |
+| browser_submit_form, any payment, password entry, arbitrary shell | T3 | refused |
+
+Typed declarations only, filtered per mode: base, tutor, browser. About 15-20 tools total.
+Audit log schema: `id, ts, tool, tier, args_hash, args_preview_redacted, decision (allowed|confirmed|denied|refused), result_status, session_id`.
+
+## 11. WhatsApp (DR-3)
+
+Method: Playwright on WhatsApp Web with a persistent profile (`DATA/whatsapp_session/`, git-ignored). QR scan once. Fallback: deep link that prefills the message and leaves Send to you. Cloud API is rejected for personal chats (business number and templates needed; general knowledge, not rechecked). Automation breaches WhatsApp's terms and UI changes can break selectors: expect occasional breakage and a small ban risk, kept small by human-confirmed, low-volume sends.
+
+Flow:
+1. intent detected -> pause cloud audio, start local private capture.
+2. capture recipient name with local faster-whisper; fuzzy match against `DATA/contacts.json` (`rapidfuzz` WRatio). Score >= 90 and a gap >= 8 over the runner-up: accept; otherwise ask "Do you mean A or B?". Below 75: ask again.
+3. capture the body locally. Read back with local Piper: "Send to <name>: <body>. Say yes to send."
+4. wait for a spoken yes. Anything else cancels.
+5. `whatsapp_send` (T2) opens the chat by phone, types, clicks Send, verifies the message bubble appears, audits.
+Dry-run switch `WHATSAPP_DRY_RUN=1` stops before clicking Send (used in tests and first runs).
+
+## 12. Browser bridge and extension (P5)
+
+Transport: WebSocket on `127.0.0.1:<BRIDGE_PORT>` only. Token: 32 random bytes generated on first run, stored in the user data dir, shown in the tray, pasted once into the extension options page. Server checks the token and the `Origin` header equals `chrome-extension://<id>`; rotates on demand.
+
+Messages (JSON, versioned `v:1`):
+- `hello {token, ext_version}` -> `ready {session_id}`.
+- push, on tab change: `tab {url, title, tab_id, incognito:false}`. For a denylisted host: `{host}` only.
+- pull: server sends `get_context {tab_id, want:["selection","text"]}`; extension returns `{url, title, selection?, text?}`.
+- actions: `act {action:"open_url"|"switch_tab"|"scroll"|"highlight"|"click"|"type", ...}` -> `result {ok, error?}`. click and type are T2; submit is T3.
+Never shared: incognito tabs (extension is disabled there and also checks `tab.incognito`), password and card fields, form field values, cookies, localStorage, anything from a denylisted domain beyond the host, any page not currently active unless asked. Page text capped at 20,000 characters; extension strips scripts, hidden elements and inputs.
+
+## 13. Tutor mode (P6)
+
+Levels: L0 "explain like I'm a baby" (one everyday analogy, no jargon), L1 beginner, L2 intermediate, L3 advanced, L4 expert (formal, edge cases, trade-offs).
+Voice shape: chunks of at most 3 short sentences, then a comprehension check ("Does that make sense, or want it simpler?"). Commands: "simpler" (level - 1), "deeper" (level + 1), "quiz me", "explain this page", "what do I know about X".
+SQLite schema:
+- `concepts(id, name, topic, created_at)`
+- `learner_concepts(concept_id, level, confusion_points_json, last_reviewed, ease, interval_days, due_at, times_seen)`
+- `quiz_results(id, concept_id, ts, level, question, correct, latency_s)`
+- `sessions(id, ts, concept_id, start_level, end_level)`
+Spaced repetition: SM-2 lite. Correct: interval = 1, then 3, then previous x ease; ease += 0.1 (max 2.8). Wrong: interval = 1, ease -= 0.2 (min 1.3), add the missed point to `confusion_points`. At session start: "You have 3 concepts due" (spoken once, skippable).
+Quizzes are generated by `Brain.think()` with `GEMINI_TEXT_MODEL` as JSON, validated with a schema, checked by the learner by voice, graded locally.
+Page context: `browser_get_context` -> privacy gate -> `explain_page(level)`. Denylisted page: Jarvis says it cannot read it.
+
+## 14. Phase map
+
+| Phase | Scope | Branch |
+|---|---|---|
+| P0 | Audit, cleanup, green baseline, model inventory | p0-audit-cleanup |
+| P1 | Config, health check, voice loop, one command, latency log, cost guard | p1-voice-core |
+| P2 | Full duplex, barge-in, AEC toggle, measured targets | p2-barge-in |
+| P3 | Tool framework, tiers, confirmation gate, audit log, kill phrase | p3-safety-tools |
+| FU-1 | Resilience and fault injection (after P3) | fu1-resilience |
+| FU-2 | Security red-team and prompt-injection tests (after P3) | fu2-redteam |
+| P4 | WhatsApp, system tools, local private capture | p4-whatsapp |
+| P5 | Chrome extension and browser tools | p5-browser |
+| P6 | Tutor mode and learner memory | p6-tutor |
+| P7 | Wake word, recovery, doctor, status UI, packaging | p7-hardening |
+| FU-3 | Full-story acceptance run and latency tuning (after P7) | fu3-acceptance |
+| FU-4 | Release, docs, clean-machine test, model-retirement runbook (after P7) | fu4-release |
+
+## 15. Traceability matrix
+
+| Must-have | Deliverable | Phase | Proof |
+|---|---|---|---|
+| Interrupt, silence <= 200 ms | local VAD cut, flush | P2 | `tests/voice/test_bargein_latency.py` p95 |
+| Keeps context of what it had said | truncated turn record | P2 | `test_truncated_turn_saved` + manual script V3 |
+| Responds to the interruption | continue streaming user audio | P2 | manual script V3 |
+| Time-to-first-audio <= 1.2 s | latency log | P1, P2 | `scripts/measure_latency.py` |
+| Zero hardcoded model strings | config only | P1 | `test_no_hardcoded_models` |
+| Health check names retired model | health.py | P1 | `test_health_fails_loudly` |
+| Cost guard 80/100% | cost.py | P1 | `test_cost_guard_thresholds` |
+| Privacy denylist | privacy.py | P3, P5 | `test_denylist_never_reaches_cloud` |
+| 429, 403, drop handling | error recovery | P1, FU-1 | chaos tests |
+| WhatsApp with confirmation | tools/whatsapp | P4 | `test_whatsapp_requires_yes`, script V5 |
+| Fuzzy contact, ask if ambiguous | matcher | P4 | `test_contact_matching` |
+| Browser sees tab, never-shared list | extension + bridge | P5 | `test_bridge_*`, script V7 |
+| Tutor L0-L4, quizzes, spaced repetition | tutor/ | P6 | `test_srs_*`, script V8 |
+| Permission tiers, audit, kill phrase | core/safety | P3 | `test_tier_matrix`, `test_killphrase` |
+| Voice layer swappable | VoiceProvider | P1 | `test_fake_provider_swap` |
+
+## 16. Top 5 risks
+
+| Risk | Likelihood / impact | Mitigation |
+|---|---|---|
+| Google retires or renames a model again | High / High | model ids only in .env; health check on every start; `jarvis doctor`; runbook in FU-4; offline fallback |
+| Cost overrun from an open or noisy session | Medium / Medium | metered guard 80/100%, idle timeout, mic gating, Cloud billing alert, Free-tier forbidden for real use |
+| Misheard WhatsApp recipient or body | Medium / High | local private capture, fuzzy match with ask-if-ambiguous, mandatory readback and spoken yes, dry-run first, audit |
+| Echo self-interrupt (Jarvis hears itself) | High on speakers / Medium | headphones default, AEC toggle, higher VAD threshold plus 250 ms in speaker mode, measured self-interrupt rate |
+| WhatsApp Web UI change or account restriction | Medium / Medium | selectors in one file, local HTML fixture test, deep-link fallback, low volume, human-confirmed |
+Also watch: prompt injection through web pages or messages (FU-2), Bluetooth latency breaking the 200 ms target (measure wired), Live API behaviour changes (UNVERIFIED items).
+
+## 17. Manual voice test script (run in FU-3, headphones on, quiet room)
+
+| # | Say / do | Expected | Pass |
+|---|---|---|---|
+| V0 | Run `python -m jarvis doctor` | all green, names both models | [ ] |
+| V1 | Start Jarvis, say "Hello" | reply starts within about 1.2 s; `logs/latency.jsonl` has a row | [ ] |
+| V2 | "Explain how a transistor works" | it starts speaking a long answer | [ ] |
+| V3 | While it speaks, say "wait, use a water analogy" | speech stops at once (<= 200 ms), it acknowledges and switches to water; later "what were you saying before?" it recalls the part it spoke | [ ] |
+| V4 | Say "Jarvis, stop everything" mid-sentence | silence, no response, state IDLE | [ ] |
+| V5 | "Send a WhatsApp to <contact> saying running ten minutes late" | it reads back name and message; say "no" -> cancelled, nothing sent; repeat and say "yes" -> sent, audit row exists | [ ] |
+| V6 | "Message Raj" with two Rajs in contacts | it asks which one | [ ] |
+| V7 | Open any article tab: "What is this page about?" | summary matching the page; open a banking tab: "Summarize this" -> it refuses and says why | [ ] |
+| V8 | "Teach me recursion" -> "simpler" -> "deeper" -> "quiz me" | level changes audibly, 3 quiz questions, results saved; next day it offers a review | [ ] |
+| V9 | Unplug internet, say "open Notepad" | offline mode announced, Notepad opens | [ ] |
+| V10 | Set `GEMINI_MONTHLY_BUDGET_USD=0.05`, talk 5 minutes | 80% warning spoken, then hard stop and offline notice | [ ] |
+
+## 18. Assumptions and unverified items
+
+- Windows 11, Python 3.12, wired headphones, owner on Gemini paid tier (manual confirmation).
+- UNVERIFIED: Live API interruption semantics and session limits; AEC via livekit.rtc APM; lowest plugin versions (we do not use LiveKit in P1); whether the lost `tools/` tree was a Windows case collision; Windows runtime of any current module.
+- Offline requirement is an owner decision (DR-6): default is degraded offline mode.
